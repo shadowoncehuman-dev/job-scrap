@@ -174,11 +174,19 @@ def clean(text: str) -> str:
     t = text.replace("\u200b", "").replace("\xa0", " ")
     return re.sub(r"\s+", " ", t).strip()
 
-def is_noise_div(tag: Tag) -> bool:
-    if tag.name not in ("div", "section", "aside", "p"):
+def _is_small_noise_element(tag: Tag) -> bool:
+    """
+    Only remove a div/section if it is SMALL and contains ONLY noise content.
+    This avoids wiping parent containers that happen to mention telegram/whatsapp
+    somewhere deep inside while also holding important tables.
+    """
+    if tag.name not in ("div", "section", "aside", "p", "table", "tr", "td"):
         return False
-    txt = tag.get_text()
-    return bool(re.search(r"join\s+our\s+(whatsapp|telegram)", txt, re.I))
+    txt = tag.get_text(strip=True)
+    # Must match noise keyword AND be short enough to not be a content container
+    if not re.search(r"join\s+our\s+(whatsapp|telegram)", txt, re.I):
+        return False
+    return len(txt) < 300   # only small elements, not big content wrappers
 
 # ── Link table parsing (2-column label|url tables) ────────────
 
@@ -531,16 +539,13 @@ def scrape_detail(url: str, category: str, listing_label: str = "") -> Optional[
     h1 = soup.find("h1")
     title = clean(h1.get_text()) if h1 else ""
 
-    # Remove noise elements
+    # Remove noise elements — be surgical: never remove large content containers
     for tag in soup.find_all(["script", "style", "iframe", "noscript", "nav"]):
         tag.decompose()
-    for tag in list(soup.find_all(["div", "section", "aside", "p"])):
-        if is_noise_div(tag):
+    # Remove small whatsapp/telegram promo elements only (len < 300 chars)
+    for tag in list(soup.find_all(True)):
+        if _is_small_noise_element(tag):
             tag.decompose()
-    for table in list(soup.find_all("table")):
-        t = table.get_text().lower()
-        if "join our whatsapp" in t or "join our telegram" in t:
-            table.decompose()
 
     # Fallback title from listing label
     if not title or len(title) < 5:
