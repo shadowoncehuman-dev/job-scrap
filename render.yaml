@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: sarkari-portal-worker
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free           # change to 'starter' for always-on (no sleep)
+    envVars:
+      - key: SUPABASE_URL
+        value: https://bqfeywhfrhbgvolwulaj.supabase.co   # your project URL
+      - key: SCRAPER_INTERVAL_MINUTES
+        value: "5"          # how often to check for new posts
+      - key: SCRAPER_LIMIT_PER_CATEGORY
+        value: "0"          # 0 = unlimited; set e.g. 30 for first runs
+      - key: REQUEST_DELAY
+        value: "1.5"        # seconds between page fetches (be polite)
+      # ── Secrets (set in Render dashboard → Environment) ──
+      - key: SUPABASE_SERVICE_KEY
+        sync: false         # mark as secret — enter value in Render dashboard
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ADMIN_CHAT_ID
+        sync: false
