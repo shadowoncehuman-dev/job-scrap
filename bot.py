@@ -1,12 +1,12 @@
 """
-Telegram Admin Bot for Sarkari Portal
-Commands: /ping /status /stats /fetch /latest /search /errors /categories /active /help
-Only responds to TELEGRAM_ADMIN_CHAT_ID for security.
+Telegram Admin Bot — Sarkari Portal
+Sends startup/restart message to admin.
+/start works for everyone so users can find their chat ID.
 """
 
-import asyncio
 import logging
 import os
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -16,26 +16,36 @@ from telegram.constants import ParseMode
 
 log = logging.getLogger("bot")
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = int(os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "0"))
 
-# ── Supabase helper ───────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────
 
 def get_sb():
-    from supabase import create_client
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-    if not url or not key:
+    try:
+        from supabase import create_client
+        url = os.environ.get("SUPABASE_URL", "")
+        key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+        if not url or not key:
+            return None
+        return create_client(url, key)
+    except Exception:
         return None
-    return create_client(url, key)
 
-# ── Auth guard ────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────
+
+def is_admin(update: Update) -> bool:
+    return ADMIN_CHAT_ID != 0 and update.effective_chat.id == ADMIN_CHAT_ID
 
 def admin_only(func):
-    """Decorator: reject all non-admin chat IDs."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != ADMIN_CHAT_ID:
-            await update.message.reply_text("⛔ Unauthorized.")
+        if not is_admin(update):
+            chat_id = update.effective_chat.id
+            await update.message.reply_text(
+                f"⛔ *Not authorized.*\n\nYour Chat ID: `{chat_id}`\n"
+                f"Set `TELEGRAM_ADMIN_CHAT_ID={chat_id}` in Render env vars to get access.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return
         return await func(update, ctx)
     wrapper.__name__ = func.__name__
@@ -48,18 +58,60 @@ def fmt_dt(iso: Optional[str]) -> str:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         return dt.strftime("%d %b %Y %H:%M UTC")
     except Exception:
-        return iso[:19]
+        return str(iso)[:16]
+
+# ── Startup message ───────────────────────────────────────────
+
+async def post_init(application: Application):
+    """Send admin a startup notification when bot comes online."""
+    if ADMIN_CHAT_ID == 0:
+        log.warning("TELEGRAM_ADMIN_CHAT_ID not set — skipping startup message")
+        return
+    try:
+        sb = get_sb()
+        total = "?"
+        if sb:
+            r = sb.table("opportunities").select("id", count="exact").execute()
+            total = str(r.count or len(r.data or []))
+
+        await application.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                "🚀 *Sarkari Portal Bot Started!*\n\n"
+                f"✅ Bot is online and running\n"
+                f"📦 Opportunities in DB: `{total}`\n"
+                f"🕐 Time: `{datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}`\n\n"
+                "Type /help to see all commands."
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        log.info("Startup message sent to admin %d", ADMIN_CHAT_ID)
+    except Exception as e:
+        log.warning("Could not send startup message: %s", e)
 
 # ── Commands ──────────────────────────────────────────────────
 
-@admin_only
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🤖 *Sarkari Portal Admin Bot*\n\n"
-        "I manage the scraper and database.\n"
-        "Type /help for all commands."
+    """/start — works for everyone. Shows chat ID if not admin."""
+    chat_id = update.effective_chat.id
+    if ADMIN_CHAT_ID == 0:
+        await update.message.reply_text(
+            f"👋 *Bot is running!*\n\n"
+            f"Your Telegram Chat ID is:\n`{chat_id}`\n\n"
+            f"Set `TELEGRAM_ADMIN_CHAT_ID={chat_id}` in your Render environment variables to get full admin access.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if not is_admin(update):
+        await update.message.reply_text(
+            f"👋 Hi! This is a private admin bot.\n\nYour Chat ID: `{chat_id}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await update.message.reply_text(
+        "🤖 *Sarkari Portal Admin Bot*\n\nWelcome back! Use /help for all commands.",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 @admin_only
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -80,23 +132,20 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ SUPABASE_URL / SUPABASE_SERVICE_KEY not set.")
         return
     try:
-        r = sb.table("opportunities").select("id", count="exact").execute()
-        total = r.count or len(r.data or [])
+        r  = sb.table("opportunities").select("id", count="exact").execute()
         r2 = sb.table("scraper_runs").select("*").order("started_at", desc=True).limit(1).execute()
+        total    = r.count or len(r.data or [])
         last_run = r2.data[0] if r2.data else None
-
-        lines = [
-            "🔍 *Connection Test*",
-            f"✅ Supabase: Connected",
-            f"📦 Total opportunities: `{total}`",
-        ]
+        lines = ["🔍 *Connection Test*", f"✅ Supabase: Connected", f"📦 Total opportunities: `{total}`"]
         if last_run:
             lines += [
                 f"⏱ Last run: `{fmt_dt(last_run.get('finished_at'))}`",
                 f"📊 Status: `{last_run.get('status')}`",
-                f"🆕 New items: `{last_run.get('items_new', 0)}`",
+                f"🆕 New: `{last_run.get('items_new', 0)}`",
                 f"⚠️ Errors: `{len(last_run.get('errors', []))}`",
             ]
+        else:
+            lines.append("ℹ️ No scraper runs yet — use /fetch to start")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode=ParseMode.MARKDOWN)
@@ -110,14 +159,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         r = sb.table("scraper_runs").select("*").order("started_at", desc=True).limit(5).execute()
         if not r.data:
-            await update.message.reply_text("No scraper runs yet.")
+            await update.message.reply_text("No scraper runs yet. Use /fetch to start.")
             return
-
+        icons = {"success": "✅", "partial": "⚠️", "error": "❌", "running": "🔄"}
         lines = ["📋 *Last 5 Scraper Runs*\n"]
         for run in r.data:
-            status_icon = {"success": "✅", "partial": "⚠️", "error": "❌", "running": "🔄"}.get(run.get("status"), "❓")
+            icon = icons.get(run.get("status"), "❓")
             lines.append(
-                f"{status_icon} `{fmt_dt(run.get('started_at'))}` — "
+                f"{icon} `{fmt_dt(run.get('started_at'))}` — "
                 f"new:{run.get('items_new',0)} err:{len(run.get('errors',[]))}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
@@ -131,110 +180,88 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not configured.")
         return
     try:
-        r = sb.table("opportunities").select("category, status", count="exact").execute()
-        data = r.data or []
-
+        r = sb.table("opportunities").select("category, status").execute()
         from collections import Counter
-        by_cat = Counter(d["category"] for d in data)
-        by_status = Counter(d["status"] for d in data)
-
-        cat_icons = {
-            "latest_job": "💼", "result": "📊", "admit_card": "🎫",
-            "answer_key": "🔑", "admission": "🏫", "syllabus": "📚",
-        }
-        status_icons = {
-            "open": "🟢", "closed": "🔴", "result_declared": "🏆",
-            "upcoming": "🔵", "cancelled": "⚫",
-        }
-
-        lines = [f"📊 *Database Statistics*\n*Total: {len(data)}*\n"]
-        lines.append("*By Category:*")
+        data = r.data or []
+        by_cat    = Counter(d["category"] for d in data)
+        by_status = Counter(d["status"]   for d in data)
+        lines = [f"📊 *DB Statistics — Total: {len(data)}*\n", "*By Category:*"]
+        cat_icons = {"railway":"🚂","ssc":"📋","upsc":"🏛","banking":"🏦","police":"👮",
+                     "defence":"⚔️","teaching":"📚","psu":"🏭","admission":"🎓",
+                     "scholarship":"🏅","result":"📊","answer_key":"🔑",
+                     "admit_card":"🎫","syllabus":"📖","central_government":"🇮🇳",
+                     "state_government":"🏛","other":"📌"}
         for cat, cnt in sorted(by_cat.items(), key=lambda x: -x[1]):
-            icon = cat_icons.get(cat, "📌")
-            lines.append(f"  {icon} {cat.replace('_',' ').title()}: `{cnt}`")
+            lines.append(f"  {cat_icons.get(cat,'📌')} {cat.replace('_',' ').title()}: `{cnt}`")
         lines.append("\n*By Status:*")
         for st, cnt in sorted(by_status.items(), key=lambda x: -x[1]):
-            icon = status_icons.get(st, "⚪")
+            icon = {"open":"🟢","closed":"🔴","result_declared":"🏆","upcoming":"🔵","cancelled":"⚫"}.get(st,"⚪")
             lines.append(f"  {icon} {st.replace('_',' ').title()}: `{cnt}`")
-
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
 
 @admin_only
 async def cmd_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    limit = 20
-    if args:
+    limit = 10
+    if ctx.args:
         try:
-            limit = int(args[0])
+            limit = int(ctx.args[0])
         except ValueError:
             pass
-
     await update.message.reply_text(
-        f"🔄 Starting scrape (limit {limit} per category)...\nThis takes a few minutes."
+        f"🔄 Starting scrape — up to *{limit}* new items per category...",
+        parse_mode=ParseMode.MARKDOWN
     )
-
-    try:
-        import threading
-        result_holder = {}
-
-        def run():
-            from scraper import run_scrape
-            result_holder["result"] = run_scrape(limit)
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        t.join(timeout=300)  # 5 min max
-
-        if t.is_alive():
-            await update.message.reply_text("⚠️ Scrape is still running in background.")
-        else:
-            res = result_holder.get("result", {})
-            await update.message.reply_text(
-                f"✅ *Scrape Complete*\n"
-                f"🆕 New: `{res.get('new', 0)}`\n"
-                f"🔁 Updated: `{res.get('updated', 0)}`\n"
-                f"⚠️ Errors: `{res.get('errors', 0)}`\n"
-                f"📦 Total: `{res.get('total', 0)}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Scrape failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+    result_holder = {}
+    def run():
+        from scraper import run_scrape
+        result_holder["r"] = run_scrape(limit)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=300)
+    if t.is_alive():
+        await update.message.reply_text("⚠️ Scrape still running in background. Check /status shortly.")
+    else:
+        res = result_holder.get("r", {})
+        await update.message.reply_text(
+            f"✅ *Scrape Complete*\n"
+            f"🆕 New: `{res.get('new', 0)}`\n"
+            f"🔁 Updated: `{res.get('updated', 0)}`\n"
+            f"⚠️ Errors: `{res.get('errors', 0)}`\n"
+            f"📦 Total local: `{res.get('total', 0)}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 @admin_only
 async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
     n = 5
-    if args:
+    if ctx.args:
         try:
-            n = min(int(args[0]), 10)
+            n = min(int(ctx.args[0]), 10)
         except ValueError:
             pass
-
     sb = get_sb()
     if not sb:
         await update.message.reply_text("❌ Not configured.")
         return
     try:
         r = sb.table("opportunities") \
-            .select("title, category, status, application_end_date, scraped_at, source_url") \
+            .select("title, category, status, application_end_date, scraped_at") \
             .order("scraped_at", desc=True).limit(n).execute()
-
         if not r.data:
-            await update.message.reply_text("No items yet.")
+            await update.message.reply_text("No items yet. Use /fetch to scrape.")
             return
-
-        cat_icons = {
-            "latest_job": "💼", "result": "📊", "admit_card": "🎫",
-            "answer_key": "🔑", "admission": "🏫", "syllabus": "📚",
-        }
-        lines = [f"🆕 *Latest {n} Scraped Items*\n"]
+        cat_icons = {"railway":"🚂","ssc":"📋","upsc":"🏛","banking":"🏦","police":"👮",
+                     "defence":"⚔️","teaching":"📚","psu":"🏭","result":"📊",
+                     "answer_key":"🔑","admit_card":"🎫","syllabus":"📖",
+                     "central_government":"🇮🇳","state_government":"🏛","other":"📌",
+                     "admission":"🎓","scholarship":"🏅"}
+        lines = [f"🆕 *Latest {n} Items*\n"]
         for d in r.data:
             icon = cat_icons.get(d.get("category"), "📌")
-            end = d.get("application_end_date", "")[:10] or "—"
-            title = d.get("title", "")[:55]
-            lines.append(f"{icon} *{title}*\n   Status: `{d.get('status')}` | Deadline: `{end}`")
+            end  = (d.get("application_end_date") or "")[:10] or "—"
+            lines.append(f"{icon} *{d.get('title','')[:55]}*\n   `{d.get('status')}` | deadline: `{end}`")
         await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
@@ -252,17 +279,14 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         r = sb.table("opportunities") \
             .select("title, category, status, application_end_date") \
-            .ilike("title", f"%{query}%") \
-            .limit(5).execute()
-
+            .ilike("title", f"%{query}%").limit(6).execute()
         if not r.data:
-            await update.message.reply_text(f"No results for `{query}`.", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"No results for *{query}*.", parse_mode=ParseMode.MARKDOWN)
             return
-
         lines = [f"🔍 *Search: {query}* — {len(r.data)} result(s)\n"]
         for d in r.data:
             end = (d.get("application_end_date") or "")[:10] or "—"
-            lines.append(f"• *{d.get('title', '')[:60]}*\n  `{d.get('category')}` | deadline: `{end}`")
+            lines.append(f"• *{d.get('title','')[:60]}*\n  `{d.get('category')}` | `{end}`")
         await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
@@ -274,24 +298,19 @@ async def cmd_errors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not configured.")
         return
     try:
-        r = sb.table("scraper_runs") \
-            .select("started_at, errors, status") \
+        r = sb.table("scraper_runs").select("started_at, errors, status") \
             .order("started_at", desc=True).limit(5).execute()
-
         all_errors = []
         for run in (r.data or []):
-            errs = run.get("errors", [])
-            if errs:
-                for e in errs[:3]:
-                    url = e.get("url", "?")
-                    err = e.get("error", "?")
-                    all_errors.append(f"`{url[-50:]}`\n  → `{err}`")
-
+            for e in (run.get("errors") or [])[:3]:
+                all_errors.append(f"`{e.get('url','?')[-50:]}`\n  → `{e.get('error','?')}`")
         if not all_errors:
             await update.message.reply_text("✅ No errors in recent runs.")
         else:
-            msg = "⚠️ *Recent Errors*\n\n" + "\n\n".join(all_errors[:10])
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "⚠️ *Recent Errors*\n\n" + "\n\n".join(all_errors[:8]),
+                parse_mode=ParseMode.MARKDOWN
+            )
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
 
@@ -302,23 +321,20 @@ async def cmd_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not configured.")
         return
     try:
-        now = datetime.now(timezone.utc).isoformat()
+        now  = datetime.now(timezone.utc).isoformat()
         week = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         r = sb.table("opportunities") \
             .select("title, category, application_end_date, apply_url") \
             .gte("application_end_date", now) \
             .lte("application_end_date", week) \
             .order("application_end_date").limit(10).execute()
-
         if not r.data:
             await update.message.reply_text("No deadlines in the next 7 days.")
             return
-
         lines = [f"⏰ *Deadlines in Next 7 Days* ({len(r.data)})\n"]
         for d in r.data:
             end = (d.get("application_end_date") or "")[:10]
-            title = d.get("title", "")[:55]
-            lines.append(f"• *{title}*\n  📅 `{end}`")
+            lines.append(f"• *{d.get('title','')[:55]}*\n  📅 `{end}`")
         await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
@@ -330,22 +346,24 @@ async def cmd_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not configured.")
         return
     try:
-        cats = ["latest_job", "result", "admit_card", "answer_key", "admission", "syllabus"]
-        lines = ["📂 *Category Breakdown*\n"]
-        for cat in cats:
-            r = sb.table("opportunities").select("id", count="exact").eq("category", cat).execute()
-            cnt = r.count or len(r.data or [])
-            r2 = sb.table("opportunities").select("scraped_at") \
-                .eq("category", cat).order("scraped_at", desc=True).limit(1).execute()
-            last = fmt_dt(r2.data[0]["scraped_at"]) if r2.data else "never"
-            lines.append(f"• *{cat.replace('_',' ').title()}*: `{cnt}` (last: {last})")
+        r = sb.table("opportunities").select("category, scraped_at").execute()
+        from collections import Counter, defaultdict
+        data = r.data or []
+        by_cat = Counter(d["category"] for d in data)
+        last   = defaultdict(str)
+        for d in data:
+            cat = d["category"]
+            if d.get("scraped_at", "") > last[cat]:
+                last[cat] = d["scraped_at"]
+        lines = [f"📂 *Category Breakdown — Total: {len(data)}*\n"]
+        for cat, cnt in sorted(by_cat.items(), key=lambda x: -x[1]):
+            lines.append(f"• *{cat.replace('_',' ').title()}*: `{cnt}` (last: {fmt_dt(last[cat])})")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
 
 @admin_only
 async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show currently open applications."""
     sb = get_sb()
     if not sb:
         await update.message.reply_text("❌ Not configured.")
@@ -354,30 +372,23 @@ async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         now = datetime.now(timezone.utc).isoformat()
         r = sb.table("opportunities") \
             .select("title, organization, application_end_date, total_vacancies") \
-            .eq("status", "open") \
-            .gte("application_end_date", now) \
+            .eq("status", "open").gte("application_end_date", now) \
             .order("application_end_date").limit(8).execute()
-
         if not r.data:
             await update.message.reply_text("No open applications right now.")
             return
-
         lines = [f"🟢 *Open Applications ({len(r.data)})*\n"]
         for d in r.data:
             end = (d.get("application_end_date") or "")[:10]
             vac = d.get("total_vacancies")
-            vac_str = f"`{vac:,} posts`" if vac else ""
-            lines.append(
-                f"• *{d.get('title','')[:55]}*\n"
-                f"  🏢 {d.get('organization','')[:40]} | 📅 `{end}` {vac_str}"
-            )
+            vstr = f" | `{vac:,} posts`" if vac else ""
+            lines.append(f"• *{d.get('title','')[:55]}*\n  📅 `{end}`{vstr}")
         await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
 
 @admin_only
 async def cmd_feature(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Mark/unmark an item as featured by slug. Usage: /feature <slug>"""
     if not ctx.args:
         await update.message.reply_text("Usage: /feature <slug>")
         return
@@ -387,74 +398,80 @@ async def cmd_feature(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not configured.")
         return
     try:
-        r = sb.table("opportunities").select("id, is_featured, title").eq("slug", slug).single().execute()
+        r = sb.table("opportunities").select("id, is_featured, title").eq("slug", slug).execute()
         if not r.data:
             await update.message.reply_text(f"❌ Not found: `{slug}`", parse_mode=ParseMode.MARKDOWN)
             return
-        current = r.data["is_featured"]
-        sb.table("opportunities").update({"is_featured": not current}).eq("slug", slug).execute()
-        state = "✅ Featured" if not current else "❌ Unfeatured"
+        item = r.data[0]
+        new_val = not item["is_featured"]
+        sb.table("opportunities").update({"is_featured": new_val}).eq("slug", slug).execute()
+        state = "✅ Featured" if new_val else "❌ Unfeatured"
         await update.message.reply_text(
-            f"{state}: *{r.data['title'][:60]}*", parse_mode=ParseMode.MARKDOWN
+            f"{state}: *{item['title'][:60]}*", parse_mode=ParseMode.MARKDOWN
         )
     except Exception as e:
         await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
 
 @admin_only
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = """
+    await update.message.reply_text("""
 🤖 *Sarkari Portal Admin Bot — Commands*
 
 *📡 Monitoring*
 /ping — Check if DB is alive
-/test — Full connection test + stats
+/test — Full connection test \+ stats
 /status — Last 5 scraper run logs
 /errors — Recent scrape errors
 
 *📊 Data*
 /stats — Counts by category and status
-/categories — Category breakdown with last-scraped time
-/latest \[n\] — Last N scraped items (default 5)
+/categories — Category breakdown
+/latest \[n\] — Last N scraped items
 /active — Deadlines in next 7 days
 /open — Currently open applications
 /search \<query\> — Search by title
 
 *⚙️ Scraper*
-/fetch \[limit\] — Run scrape now (default 20 per category)
+/fetch \[n\] — Run scrape now \(n per category\)
 
-*🛠 Management*
-/feature \<slug\> — Toggle featured flag on an item
+*🛠 Admin*
+/feature \<slug\> — Toggle featured flag
 /help — This message
-"""
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+""", parse_mode=ParseMode.MARKDOWN)
 
-# ── App builder ───────────────────────────────────────────────
+# ── Build & run ───────────────────────────────────────────────
 
 def build_app() -> Application:
     if not BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN not set")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("ping",       cmd_ping))
-    app.add_handler(CommandHandler("test",       cmd_test))
-    app.add_handler(CommandHandler("status",     cmd_status))
-    app.add_handler(CommandHandler("stats",      cmd_stats))
-    app.add_handler(CommandHandler("fetch",      cmd_fetch))
-    app.add_handler(CommandHandler("latest",     cmd_latest))
-    app.add_handler(CommandHandler("search",     cmd_search))
-    app.add_handler(CommandHandler("errors",     cmd_errors))
-    app.add_handler(CommandHandler("active",     cmd_active))
-    app.add_handler(CommandHandler("categories", cmd_categories))
-    app.add_handler(CommandHandler("open",       cmd_open))
-    app.add_handler(CommandHandler("feature",    cmd_feature))
-    app.add_handler(CommandHandler("help",       cmd_help))
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    for name, handler in [
+        ("start",      cmd_start),
+        ("ping",       cmd_ping),
+        ("test",       cmd_test),
+        ("status",     cmd_status),
+        ("stats",      cmd_stats),
+        ("fetch",      cmd_fetch),
+        ("latest",     cmd_latest),
+        ("search",     cmd_search),
+        ("errors",     cmd_errors),
+        ("active",     cmd_active),
+        ("categories", cmd_categories),
+        ("open",       cmd_open),
+        ("feature",    cmd_feature),
+        ("help",       cmd_help),
+    ]:
+        app.add_handler(CommandHandler(name, handler))
     return app
 
 def run_bot():
     log.info("Starting Telegram bot...")
-    app = build_app()
-    app.run_polling(drop_pending_updates=True)
+    build_app().run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
