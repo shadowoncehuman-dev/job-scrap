@@ -1,22 +1,23 @@
 services:
-  - type: worker
-    name: sarkari-portal-worker
+  - type: web                      # ← Web Service (has free tier)
+    name: sarkari-portal
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    plan: free           # change to 'starter' for always-on (no sleep)
+    plan: free
+    healthCheckPath: /health       # Render pings this to check the service is up
     envVars:
       - key: SUPABASE_URL
-        value: https://bqfeywhfrhbgvolwulaj.supabase.co   # your project URL
+        value: https://bqfeywhfrhbgvolwulaj.supabase.co
       - key: SCRAPER_INTERVAL_MINUTES
-        value: "5"          # how often to check for new posts
+        value: "5"
       - key: SCRAPER_LIMIT_PER_CATEGORY
-        value: "0"          # 0 = unlimited; set e.g. 30 for first runs
+        value: "0"
       - key: REQUEST_DELAY
-        value: "1.5"        # seconds between page fetches (be polite)
-      # ── Secrets (set in Render dashboard → Environment) ──
+        value: "1.5"
+      # ── Set these as secrets in Render dashboard ──
       - key: SUPABASE_SERVICE_KEY
-        sync: false         # mark as secret — enter value in Render dashboard
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_ADMIN_CHAT_ID
