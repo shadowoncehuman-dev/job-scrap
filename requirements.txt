@@ -1,0 +1,8 @@
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+schedule==1.2.2
+python-slugify==8.0.4
+supabase==2.5.1
+psycopg2-binary==2.9.9
+python-telegram-bot==21.3
