@@ -69,8 +69,10 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", 0))
                 body   = json.loads(self.rfile.read(length))
                 if BOT_ENABLED:
-                    from bot import submit_update
-                    submit_update(body)
+                    from bot import handle_webhook_update
+                    threading.Thread(
+                        target=handle_webhook_update, args=(body,), daemon=True
+                    ).start()
             except Exception as e:
                 log.error("Webhook handler error: %s", e)
             # Always return 200 so Telegram doesn't retry aggressively
