@@ -5,4 +5,3 @@ schedule==1.2.2
 python-slugify==8.0.4
 supabase==2.5.1
 psycopg2-binary==2.9.9
-python-telegram-bot==21.3
